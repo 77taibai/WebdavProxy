@@ -2,7 +2,9 @@ import asyncio
 import base64
 import hmac
 import logging
+import re
 import time
+from urllib.parse import quote, unquote, urlsplit
 
 from aiohttp import (
     ClientError,
@@ -22,6 +24,15 @@ _REALM = 'Basic realm="webdav-proxy"'
 WRITE_METHODS = frozenset(
     {"PUT", "DELETE", "MKCOL", "COPY", "MOVE", "PROPPATCH", "LOCK", "UNLOCK", "POST"}
 )
+
+_MULTISTATUS_METHODS = frozenset({"PROPFIND", "REPORT"})
+
+_HREF_RE = re.compile(
+    rb"<(?P<open>[A-Za-z0-9_.]*:?)href[^>]*>(?P<value>[^<]*)</(?P<close>[A-Za-z0-9_.]*:?)href\s*>",
+    re.IGNORECASE,
+)
+
+_URL_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://[^/]*)(/.*)$", re.DOTALL)
 
 _STRIP_REQUEST_HEADERS = frozenset(
     {
@@ -66,6 +77,46 @@ def _basic_token(user, password):
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
+def _strip_href_prefix(value, prefix):
+    if not prefix:
+        return value
+    decoded = unquote(value)
+    path_part, query_sep, query = decoded.partition("?")
+    host = ""
+    url_match = _URL_RE.match(path_part)
+    if url_match:
+        host = url_match.group(1)
+        path = url_match.group(2)
+    else:
+        path = path_part
+    if path == prefix:
+        new_path = "/"
+    elif path.startswith(prefix + "/"):
+        new_path = path[len(prefix):]
+    else:
+        return value
+    new_path = quote(new_path, safe="/@&=+$,;~*'()!-._")
+    return host + new_path + (query_sep + query if query_sep else "")
+
+
+def _rewrite_multistatus(body, prefix):
+    out = bytearray()
+    pos = 0
+    for match in _HREF_RE.finditer(body):
+        out += body[pos:match.start()]
+        value_bytes = match.group("value")
+        try:
+            value = value_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            value = value_bytes.decode("latin-1")
+        out += body[match.start():match.start("value")]
+        out += _strip_href_prefix(value, prefix).encode("utf-8")
+        out += body[match.end("value"):match.end()]
+        pos = match.end()
+    out += body[pos:]
+    return bytes(out)
+
+
 def _is_authenticated(config, request):
     header = request.headers.get("Authorization", "")
     scheme, _, encoded = header.partition(" ")
@@ -107,7 +158,11 @@ async def _forward(request):
     if config.read_only and request.method in WRITE_METHODS:
         return web.json_response({"error": "read-only mode"}, status=403)
 
-    target = config.upstream_url.rstrip("/") + request.raw_path
+    target = (
+        config.upstream_url.rstrip("/")
+        + config.upstream_root_path
+        + request.raw_path
+    )
 
     upstream_headers = CIMultiDict()
     for name, value in request.headers.items():
@@ -136,6 +191,23 @@ async def _forward(request):
     for name, value in upstream.headers.items():
         if name.lower() not in _STRIP_RESPONSE_HEADERS:
             out_headers.add(name, value)
+
+    if (
+        request.method in _MULTISTATUS_METHODS
+        and upstream.status == 207
+        and config.href_strip_prefix
+    ):
+        raw_body = await upstream.content.read()
+        upstream.release()
+        body = _rewrite_multistatus(raw_body, config.href_strip_prefix)
+        logger.info(
+            "%s %s -> %s (href rewritten, %.3fs)",
+            request.method,
+            request.raw_path,
+            upstream.status,
+            time.perf_counter() - started,
+        )
+        return web.Response(status=207, body=body, headers=out_headers)
 
     response = web.StreamResponse(status=upstream.status, headers=out_headers)
     try:

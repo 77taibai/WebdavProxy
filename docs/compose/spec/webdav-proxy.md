@@ -43,6 +43,7 @@ commits: e2db059..e2b31fd
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `UPSTREAM_URL` | 是 | — | 上游 WebDAV 基地址，如 `https://dav.example.com/dav/` |
+| `UPSTREAM_ROOT_PATH` | 否 | 空 | 上游根路径前缀，拼在转发路径前；设为 `/test` 时客户端 `/abc` 命中上游 `/test/abc`，留空不做映射 |
 | `UPSTREAM_USER` | 否 | 空 | 上游 Basic 认证用户名 |
 | `UPSTREAM_PASSWORD` | 否 | 空 | 上游 Basic 认证密码 |
 | `PROXY_USER` | 是 | — | 代理对客户端要求的 Basic 用户名 |
@@ -64,7 +65,7 @@ commits: e2db059..e2b31fd
 
 - 允许方法：`OPTIONS, GET, HEAD, PROPFIND, REPORT, PROPPATCH, PUT, DELETE, MKCOL, COPY, MOVE, LOCK, UNLOCK, POST` 之外的未知方法也原样转发（WebDAV 扩展方法兼容）。
 - 请求转发规则：
-  - 上游 URL = `UPSTREAM_URL` 基地址拼接请求路径与查询串。
+  - 上游 URL = `UPSTREAM_URL` 基地址 + `UPSTREAM_ROOT_PATH` 前缀（可空）+ 请求路径与查询串。
   - 复制客户端请求头，剔除逐跳头（`Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade`）及 `Host, Content-Length, Authorization, Accept-Encoding`（由客户端库自动生成）。
   - `Authorization` 替换为上游凭据（若配置了 `UPSTREAM_USER`）；客户端的原凭据永不透传。
   - 请求体流式转发（`request.content` 直接作为客户端 body），支持大文件上传，不整体驻留内存。
@@ -102,7 +103,7 @@ commits: e2db059..e2b31fd
 - HTTPS/TLS 终结（由 SaaS 平台网关或反向代理负责）。
 - 多代理账号及按账号分级的读写权限（已决策为全局 `READ_ONLY` 开关）。
 - 缓存、上传/下载限速、请求计费或配额。
-- 对上游响应的任何内容改写（如重写 PROPFIND 中返回的 URL 字段）。
+- PROPFIND/REPORT 之外的内容重写：`GET`/`PUT` 等响应体永不改写。但配置了根路径前缀（`UPSTREAM_ROOT_PATH`）时，207 multistatus 中的 `<D:href>` 必须剥离「上游路径 + 前缀」，否则客户端目录视图会多出幻影层级（见修订记录）。
 - WebDAV 客户端兼容性专项测试（仅覆盖常见方法与 GET 下载链路）。
 
 ## Tasks

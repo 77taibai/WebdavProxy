@@ -7,7 +7,7 @@
 | 变量 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `UPSTREAM_URL` | 是 | — | 上游 WebDAV 基地址，如 `https://dav.example.com/dav/` |
-| `UPSTREAM_USER` | 否 | 空 | 上游 Basic 认证用户名 |
+| `UPSTREAM_ROOT_PATH` | 否 | 空 | 上游根路径前缀：代理把它拼在请求路径前。设为 `/test` 时客户端访问 `/` 命中上游 `/test/`、访问 `/abc` 命中上游 `/test/abc`；留空不做前缀映射 || `UPSTREAM_USER` | 否 | 空 | 上游 Basic 认证用户名 |
 | `UPSTREAM_PASSWORD` | 否 | 空 | 上游 Basic 认证密码 |
 | `PROXY_USER` | 是 | — | 代理对客户端要求的 Basic 用户名 |
 | `PROXY_PASSWORD` | 是 | — | 代理对客户端要求的 Basic 密码 |
@@ -16,6 +16,8 @@
 | `HOST` | 否 | `0.0.0.0` | 监听地址；容器内保持默认 `0.0.0.0`，本地运行可设为 `127.0.0.1` |
 
 缺少任一必填变量（`UPSTREAM_URL`、`PROXY_USER`、`PROXY_PASSWORD`）时启动失败并退出，打印缺失的变量名。
+
+根路径前缀说明：设置 `UPSTREAM_ROOT_PATH` 后，代理会同步重写 `PROPFIND`/`REPORT` 的 207 响应中的 `<D:href>` 链接（剥去「上游路径 + 前缀」整段，还原为客户端视角的相对路径），保证客户端目录视图与代理路径一致；`GET`/`PUT` 等其他响应内容不做任何改写。
 
 ## 本地运行
 

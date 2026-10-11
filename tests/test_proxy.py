@@ -1,12 +1,18 @@
 import asyncio
 import functools
 import socket
+from urllib.parse import urlsplit
 
 from aiohttp import encode_basic_auth, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from webdav_proxy.config import Config
-from webdav_proxy.proxy import WRITE_METHODS, create_app
+from webdav_proxy.proxy import (
+    WRITE_METHODS,
+    _rewrite_multistatus,
+    _strip_href_prefix,
+    create_app,
+)
 
 PROXY_USER = "client"
 PROXY_PASSWORD = "client-pass"
@@ -20,6 +26,15 @@ PROPFIND_XML = (
     '<?xml version="1.0" encoding="utf-8"?>'
     '<D:multistatus xmlns:D="DAV:"><D:response><D:href>/</D:href>'
     "</D:response></D:multistatus>"
+).encode()
+
+PROPFIND_ROOT_XML = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<D:multistatus xmlns:D="DAV:">'
+    '<D:response><D:href>/test/</D:href></D:response>'
+    '<D:response><D:href>/test/%E7%94%B5%E5%BD%B1.mkv</D:href></D:response>'
+    '<D:response><D:href>/other/book.pdf</D:href></D:response>'
+    "</D:multistatus>"
 ).encode()
 
 CLIENT_AUTH = encode_basic_auth(PROXY_USER, PROXY_PASSWORD)
@@ -37,9 +52,10 @@ def aio_test(func):
     return wrapper
 
 
-def make_config(read_only=False, upstream_url="http://upstream.invalid/dav/"):
+def make_config(read_only=False, upstream_url="http://upstream.invalid/dav/", root_path=""):
     return Config(
         upstream_url=upstream_url,
+        upstream_root_path=root_path,
         upstream_user=UPSTREAM_USER,
         upstream_password=UPSTREAM_PASSWORD,
         proxy_user=PROXY_USER,
@@ -47,6 +63,7 @@ def make_config(read_only=False, upstream_url="http://upstream.invalid/dav/"):
         read_only=read_only,
         host="127.0.0.1",
         port=8080,
+        href_strip_prefix=urlsplit(upstream_url).path.rstrip("/") + root_path,
     )
 
 
@@ -94,16 +111,27 @@ def make_upstream(state):
         state["last_qs"] = request.rel_url.query_string
         return web.Response(status=204)
 
+    async def prefixed(request):
+        state["last_path"] = request.path
+        state["last_qs"] = request.rel_url.query_string
+        if request.method == "PROPFIND":
+            state["propfind_root"] += 1
+            return web.Response(
+                status=207, body=PROPFIND_ROOT_XML, headers={"Content-Type": "application/xml"}
+            )
+        return web.Response(text="prefixed")
+
     app = web.Application(middlewares=[guard])
     app.router.add_route("PROPFIND", "/", propfind)
     app.router.add_route("GET", "/big", big)
     app.router.add_route("GET", "/files/big.txt", big_file)
     app.router.add_route("*", "/write", write_handler)
     app.router.add_route("*", "/forward", any_method)
+    app.router.add_route("*", "/test{tail:.*}", prefixed)
     return app
 
 
-async def start_stack(read_only=False, upstream_url=None):
+async def start_stack(read_only=False, upstream_url=None, upstream_root_path=""):
     state = {
         "writes": [],
         "methods": [],
@@ -114,6 +142,8 @@ async def start_stack(read_only=False, upstream_url=None):
         "auth_failures": 0,
         "last_body": None,
         "last_qs": "",
+        "last_path": "",
+        "propfind_root": 0,
         "auth_on_cross_host": "unset",
     }
     upstream_server = TestServer(make_upstream(state))
@@ -121,7 +151,13 @@ async def start_stack(read_only=False, upstream_url=None):
     if upstream_url is None:
         upstream_url = str(upstream_server.make_url(""))
     proxy_server = TestServer(
-        create_app(make_config(read_only=read_only, upstream_url=upstream_url))
+        create_app(
+            make_config(
+                read_only=read_only,
+                upstream_url=upstream_url,
+                root_path=upstream_root_path,
+            )
+        )
     )
     await proxy_server.start_server()
     return TestClient(proxy_server), upstream_server, state
@@ -325,6 +361,83 @@ async def test_query_string_forwarded():
         assert state["last_qs"] == "a=1&b=two"
     finally:
         await stop_stack(client, upstream)
+
+
+@aio_test
+async def test_root_path_prefix_maps_client_paths():
+    client, upstream, state = await start_stack(upstream_root_path="/test")
+    try:
+        resp = await client.get("/", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert await resp.text() == "prefixed"
+        assert state["last_path"] == "/test/"
+
+        resp = await client.get("/abc", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert state["last_path"] == "/test/abc"
+    finally:
+        await stop_stack(client, upstream)
+
+
+@aio_test
+async def test_root_path_prefix_preserves_query_string():
+    client, upstream, state = await start_stack(upstream_root_path="/test")
+    try:
+        resp = await client.get(
+            "/abc", params={"a": "1"}, headers={"Authorization": CLIENT_AUTH}
+        )
+        assert resp.status == 200
+        assert state["last_path"] == "/test/abc"
+        assert state["last_qs"] == "a=1"
+    finally:
+        await stop_stack(client, upstream)
+
+
+@aio_test
+async def test_root_path_rewrites_propfind_href_prefixes():
+    client, upstream, state = await start_stack(upstream_root_path="/test")
+    try:
+        resp = await client.request(
+            "PROPFIND", "/", headers={"Authorization": CLIENT_AUTH}
+        )
+        assert resp.status == 207
+        assert state["last_path"] == "/test/"
+        body = (await resp.read()).decode("utf-8")
+        assert "<D:href>/</D:href>" in body
+        assert "%E7%94%B5%E5%BD%B1.mkv" in body
+        assert "<D:href>/other/book.pdf</D:href>" in body
+    finally:
+        await stop_stack(client, upstream)
+
+
+def test_strip_href_prefix_variants():
+    assert _strip_href_prefix("/test/", "/test") == "/"
+    assert _strip_href_prefix("/test", "/test") == "/"
+    assert (
+        _strip_href_prefix("/test/%E7%94%B5%E5%BD%B1.mkv", "/test")
+        == "/%E7%94%B5%E5%BD%B1.mkv"
+    )
+    assert _strip_href_prefix("/test/电影.mkv", "/test") == "/%E7%94%B5%E5%BD%B1.mkv"
+    assert (
+        _strip_href_prefix("http://h/dav/test/a.txt", "/dav/test") == "http://h/a.txt"
+    )
+    assert (
+        _strip_href_prefix("http://h/dav/test/a.txt?op=1", "/dav/test")
+        == "http://h/a.txt?op=1"
+    )
+    assert _strip_href_prefix("/other/file", "/test") == "/other/file"
+    assert _strip_href_prefix("/testx/file", "/test") == "/testx/file"
+    assert _strip_href_prefix("/keep/x", "") == "/keep/x"
+
+
+def test_rewrite_multistatus_keeps_other_tags():
+    xml = (
+        '<D:multistatus><D:response><D:href>/test/a.txt</D:href>'
+        "<D:displayname>a.txt</D:displayname></D:response></D:multistatus>"
+    ).encode("utf-8")
+    out = _rewrite_multistatus(xml, "/test").decode("utf-8")
+    assert "<D:href>/a.txt</D:href>" in out
+    assert "<D:displayname>a.txt</D:displayname>" in out
 
 
 @aio_test

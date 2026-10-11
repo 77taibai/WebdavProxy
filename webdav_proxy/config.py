@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 REQUIRED_KEYS = ("UPSTREAM_URL", "PROXY_USER", "PROXY_PASSWORD")
 
@@ -15,6 +16,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class Config:
     upstream_url: str
+    upstream_root_path: str
     upstream_user: str
     upstream_password: str
     proxy_user: str
@@ -22,6 +24,7 @@ class Config:
     read_only: bool
     host: str
     port: int
+    href_strip_prefix: str = ""
 
 
 def _parse_line(line):
@@ -81,8 +84,17 @@ def load_config(env=None, env_file=None):
     except ValueError:
         raise ConfigError(f"Invalid PORT value: {port_raw!r}") from None
 
+    root_path = (get("UPSTREAM_ROOT_PATH") or "").strip()
+    if root_path and not root_path.startswith("/"):
+        root_path = "/" + root_path
+    root_path = root_path.rstrip("/")
+
+    upstream_url = get("UPSTREAM_URL")
+    href_strip_prefix = urlsplit(upstream_url).path.rstrip("/") + root_path
+
     return Config(
-        upstream_url=get("UPSTREAM_URL"),
+        upstream_url=upstream_url,
+        upstream_root_path=root_path,
         upstream_user=get("UPSTREAM_USER") or "",
         upstream_password=get("UPSTREAM_PASSWORD") or "",
         proxy_user=get("PROXY_USER"),
@@ -90,4 +102,5 @@ def load_config(env=None, env_file=None):
         read_only=_parse_bool(get("READ_ONLY") or ""),
         host=get("HOST") or _DEFAULT_HOST,
         port=port,
+        href_strip_prefix=href_strip_prefix,
     )

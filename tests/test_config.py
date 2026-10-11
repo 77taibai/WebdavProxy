@@ -101,6 +101,30 @@ class TestDefaultsAndOverrides:
             load(env=make_env(PORT="not-a-number"))
 
 
+class TestRootPath:
+    def test_default_is_empty(self):
+        config = load(env=make_env())
+        assert config.upstream_root_path == ""
+        assert config.href_strip_prefix == "/dav"
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("test", "/test"),
+            ("/test", "/test"),
+            ("/test/", "/test"),
+            ("a/b/", "/a/b"),
+            (" ", ""),
+        ],
+    )
+    def test_normalization(self, raw, expected):
+        assert load(env=make_env(UPSTREAM_ROOT_PATH=raw)).upstream_root_path == expected
+
+    def test_href_strip_prefix_combines_url_path_and_root(self):
+        config = load(env=make_env(UPSTREAM_ROOT_PATH="/test/"))
+        assert config.href_strip_prefix == "/dav/test"
+
+
 class TestDotenv:
     def test_parses_export_quotes_and_comments(self, tmp_path):
         env_file = write_env_file(tmp_path, DOTENV_TEXT)
