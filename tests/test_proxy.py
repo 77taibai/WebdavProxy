@@ -1,6 +1,9 @@
 import asyncio
 import functools
+import logging
+import pytest
 import socket
+import struct
 from urllib.parse import urlsplit
 
 from aiohttp import encode_basic_auth, web
@@ -48,8 +51,8 @@ def basic_header(user, password):
 
 def aio_test(func):
     @functools.wraps(func)
-    def wrapper():
-        asyncio.run(func())
+    def wrapper(*args, **kwargs):
+        return asyncio.run(func(*args, **kwargs))
 
     return wrapper
 
@@ -525,6 +528,62 @@ async def test_compressed_response_omits_stale_content_length():
 
 
 @aio_test
+async def test_abort_during_retry_window_logs_client_abort_not_crash(
+    monkeypatch, caplog
+):
+    from webdav_proxy import proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RETRY_DELAYS", (0.2, 0.3, 0.5))
+    stale = (_raw_head("HTTP/1.1 200 OK", "Content-Length: 99\r\n"), None)
+    healthy = (
+        _raw_head("HTTP/1.1 200 OK", "Content-Length: 5\r\n"),
+        b"HELLO",
+    )
+    flaky = _RawUpstream([stale, stale, healthy])
+    await flaky.start()
+
+    from aiohttp.web import AppRunner, TCPSite
+
+    runner = AppRunner(
+        create_app(
+            make_config(
+                upstream_url=flaky.url,
+                root_path="",
+            )
+        ),
+        handler_cancellation=False,
+    )
+    await runner.setup()
+    site = TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        request_line = (
+            f"GET /video.mp4 HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Authorization: {CLIENT_AUTH}\r\n\r\n"
+        )
+        writer.write(request_line.encode("ascii"))
+        await writer.drain()
+        await asyncio.sleep(0.4)
+        raw_socket = writer.transport.get_extra_info("socket")
+        raw_socket.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
+        writer.close()
+        with caplog.at_level(logging.INFO, logger="webdav_proxy.proxy"):
+            await asyncio.sleep(1.5)
+        assert "UnboundLocalError" not in caplog.text
+        assert "client aborted transfer" in caplog.text
+        assert flaky.connections == 3
+    finally:
+        await runner.cleanup()
+        await flaky.close()
+
+
+@aio_test
 async def test_upstream_unreachable_returns_502():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -539,3 +598,200 @@ async def test_upstream_unreachable_returns_502():
         assert "error" in payload
     finally:
         await stop_stack(client, upstream)
+
+
+class _RawUpstream:
+    """Bare-socket upstream serving scripted raw responses per connection."""
+
+    def __init__(self, behaviors):
+        self.behaviors = behaviors
+        self.connections = 0
+        self._server = None
+
+    async def start(self):
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+
+    async def close(self):
+        self._server.close()
+        await self._server.wait_closed()
+
+    @property
+    def url(self):
+        host, port = self._server.sockets[0].getsockname()[:2]
+        return f"http://{host}:{port}/dav/"
+
+    async def _handle(self, reader, writer):
+        index = min(self.connections, len(self.behaviors) - 1)
+        self.connections += 1
+        head, body = self.behaviors[index]
+        writer.write(head)
+        await writer.drain()
+        if body is not None:
+            writer.write(body)
+            await writer.drain()
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _raw_head(status_line, extra):
+    head = status_line + "\r\n" + extra + "Connection: close\r\n\r\n"
+    return head.encode("ascii")
+
+
+@aio_test
+async def test_stale_upstream_connection_recovers_via_retry(caplog):
+    flaky = _RawUpstream(
+        [
+            (
+                _raw_head("HTTP/1.1 200 OK", "Content-Length: 100\r\n"),
+                None,
+            ),
+            (
+                _raw_head("HTTP/1.1 200 OK", "Content-Length: 5\r\n"),
+                b"HELLO",
+            ),
+        ]
+    )
+    await flaky.start()
+    client, upstream, state = await start_stack(upstream_url=flaky.url)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webdav_proxy.proxy"):
+            resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert await resp.read() == b"HELLO"
+        assert flaky.connections == 2
+        assert "retry" in caplog.text
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()
+
+
+@aio_test
+async def test_upstream_stale_connections_recover_on_third_attempt(caplog):
+    stale = (_raw_head("HTTP/1.1 200 OK", "Content-Length: 99\r\n"), None)
+    healthy = (
+        _raw_head("HTTP/1.1 200 OK", "Content-Length: 5\r\n"),
+        b"HELLO",
+    )
+    flaky = _RawUpstream([stale, stale, healthy])
+    await flaky.start()
+    client, upstream, state = await start_stack(upstream_url=flaky.url)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webdav_proxy.proxy"):
+            resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert await resp.read() == b"HELLO"
+        assert flaky.connections == 3
+        assert "retry 2/5" in caplog.text
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()
+
+
+@aio_test
+async def test_retry_recovers_on_last_scheduled_attempt(monkeypatch, caplog):
+    from webdav_proxy import proxy as proxy_module
+
+    monkeypatch.setattr(
+        proxy_module, "_UPSTREAM_RETRY_DELAYS", (0.01, 0.01, 0.01, 0.01, 0.01)
+    )
+    stale = (_raw_head("HTTP/1.1 200 OK", "Content-Length: 99\r\n"), None)
+    healthy = (
+        _raw_head("HTTP/1.1 200 OK", "Content-Length: 5\r\n"),
+        b"HELLO",
+    )
+    flaky = _RawUpstream([stale, stale, stale, stale, stale, healthy])
+    await flaky.start()
+    client, upstream, state = await start_stack(upstream_url=flaky.url)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webdav_proxy.proxy"):
+            resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert await resp.read() == b"HELLO"
+        assert flaky.connections == 6
+        assert "retry 5/5" in caplog.text
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()
+
+
+@aio_test
+async def test_retry_deadline_exhausted_returns_502(monkeypatch, caplog):
+    from webdav_proxy import proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RETRY_DELAYS", (0.05, 0.05, 0.05))
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RETRY_DEADLINE", 0.02)
+    stale = (_raw_head("HTTP/1.1 200 OK", "Content-Length: 99\r\n"), None)
+    flaky = _RawUpstream([stale])
+    await flaky.start()
+    client, upstream, state = await start_stack(upstream_url=flaky.url)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webdav_proxy.proxy"):
+            resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 502
+        payload = await resp.json()
+        assert "try again" in payload["error"]
+        assert flaky.connections == 1
+        assert "not ready" in caplog.text
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()
+
+
+@aio_test
+async def test_upstream_truncation_mid_stream_logs_friendly_hint(caplog):
+    flaky = _RawUpstream(
+        [
+            (
+                _raw_head("HTTP/1.1 200 OK", "Content-Length: 10\r\n"),
+                b"AB",
+            )
+        ]
+    )
+    await flaky.start()
+    client, upstream, state = await start_stack(upstream_url=flaky.url)
+    try:
+        with caplog.at_level(logging.WARNING, logger="webdav_proxy.proxy"):
+            resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+            assert resp.status == 200
+            with pytest.raises(Exception):
+                await resp.read()
+        assert "truncated" in caplog.text
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()
+
+
+@aio_test
+async def test_upstream_zero_body_before_prepare_returns_clean_502(monkeypatch):
+    from webdav_proxy import proxy as proxy_module
+
+    monkeypatch.setattr(proxy_module, "_UPSTREAM_RETRY_DELAYS", (0.01, 0.01))
+    flaky = _RawUpstream(
+        [
+            (
+                _raw_head("HTTP/1.1 200 OK", "Content-Length: 100\r\n"),
+                None,
+            )
+        ]
+    )
+    await flaky.start()
+    client, upstream, state = await start_stack(
+        upstream_url=flaky.url,
+        read_only=True,
+    )
+    try:
+        resp = await client.put(
+            "/video.mp4", data=b"x", headers={"Authorization": CLIENT_AUTH}
+        )
+        assert resp.status == 403
+        resp = await client.get("/video.mp4", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 502
+        payload = await resp.json()
+        assert "error" in payload
+    finally:
+        await stop_stack(client, upstream)
+        await flaky.close()

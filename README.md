@@ -61,5 +61,6 @@ Invoke-WebRequest http://127.0.0.1:8080/healthz
 - **TLS**：代理仅提供 HTTP，HTTPS/TLS 终结由 SaaS 平台网关或反向代理负责。
 - **已知限制**：上游对带请求体的写方法（如 PUT）返回重定向时，重定向无法携带已消费的流式上传体，代理将返回 `502` 并给出明确错误信息；下载链路（GET/HEAD）的 302 跟随不受影响。
 - **断点续传 / 指定位置播放**：`Range`、`If-Range` 等头原样透传并在 302 跳转后保留，上游返回的 `206 Partial Content` 与 `Content-Range` 原样回传；非压缩响应保留上游 `Content-Length`（`HEAD` 探测也可拿到文件总长度），视频客户端可任意跳转播放而无需从头下载。
+- **上游连接稳定性（冷启动兼容）**：代理在把响应提交给客户端前先读取上游首个数据块；若遇到「声称 Content-Length 却 0 字节断开」的失效连接（包括上游需要先激活/冷启动大文件的情形），会自动换新连接重试：退避序列 1s/2s/4s/6s/8s（重试点约在 1/3/7/13/21s），总预算 30s，对客户端完全透明。预算耗尽返回干净的 `502`，错误信息提示稍后再试。上游中途断流时日志输出 `upstream stream truncated after X/Y bytes; client should resume via Range`，播放器按标准行为用 Range 断点重试即可续传。
 - **日志**：仅记录方法、路径、状态码、耗时；任何凭据均不落日志。
-- **客户端中断**：客户端取消下载/断开连接属正常事件，日志为单行 `client aborted transfer`（INFO）；Windows 上事件循环层的 `WinError 10054` 噪音已被事件循环异常处理器抑制，不会打印完整 traceback。
+- **客户端中断**：客户端取消下载/断开连接属正常事件，日志为单行 `client aborted transfer`（含已发送字节数）；无论中断发生在准备响应头阶段还是传输中途，都不会产生 traceback。

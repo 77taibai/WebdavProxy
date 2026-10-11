@@ -7,10 +7,13 @@ import time
 from urllib.parse import quote, unquote, urlsplit
 
 from aiohttp import (
+    ClientConnectionError,
     ClientError,
+    ClientPayloadError,
     ClientSession,
     ClientTimeout,
     DummyCookieJar,
+    TCPConnector,
     web,
 )
 from multidict import CIMultiDict
@@ -26,6 +29,10 @@ WRITE_METHODS = frozenset(
 )
 
 _MULTISTATUS_METHODS = frozenset({"PROPFIND", "REPORT"})
+
+_IDEMPOTENT_METHODS = frozenset(
+    {"GET", "HEAD", "OPTIONS", "PROPFIND", "REPORT"}
+)
 
 _HREF_RE = re.compile(
     rb"<(?P<open>[A-Za-z0-9_.]*:?)href[^>]*>(?P<value>[^<]*)</(?P<close>[A-Za-z0-9_.]*:?)href\s*>",
@@ -89,6 +96,9 @@ _STRIP_RESPONSE_HEADERS = frozenset(
 )
 
 _CLIENT_TIMEOUT = ClientTimeout(connect=10, sock_read=300)
+
+_UPSTREAM_RETRY_DEADLINE = 30.0
+_UPSTREAM_RETRY_DELAYS = (1.0, 2.0, 4.0, 6.0, 8.0)
 
 _CONFIG_KEY = web.AppKey("config", Config)
 _SESSION_KEY = web.AppKey("upstream_session", ClientSession)
@@ -196,18 +206,80 @@ async def _forward(request):
         )
 
     session = request.app[_SESSION_KEY]
-    try:
-        upstream = await session.request(
+    can_retry = request.method in _IDEMPOTENT_METHODS and not request.can_read_body
+    data = request.content if request.can_read_body else None
+
+    async def _open_upstream():
+        resp = await session.request(
             request.method,
             target,
             headers=upstream_headers,
-            data=request.content if request.can_read_body else None,
+            data=data,
             allow_redirects=True,
         )
-    except (ClientError, asyncio.TimeoutError, ValueError) as exc:
-        message = str(exc) or type(exc).__name__
-        logger.warning("%s %s -> 502 (%s)", request.method, request.raw_path, message)
-        return web.json_response({"error": message}, status=502)
+        try:
+            chunk = await resp.content.readany()
+        except Exception:
+            resp.close()
+            raise
+        return resp, chunk
+
+    upstream = None
+    first_chunk = b""
+    retry_started = 0.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            upstream, first_chunk = await _open_upstream()
+            break
+        except (ClientError, ConnectionError, asyncio.TimeoutError, ValueError) as exc:
+            stale_error = isinstance(exc, (ClientPayloadError, ConnectionError))
+            message = str(exc) or type(exc).__name__
+            if not (can_retry and stale_error):
+                logger.warning(
+                    "%s %s -> 502 (%s)", request.method, request.raw_path, message
+                )
+                return web.json_response({"error": message}, status=502)
+            if not retry_started:
+                retry_started = time.perf_counter()
+            exhausted = attempt > len(_UPSTREAM_RETRY_DELAYS) or (
+                time.perf_counter() - retry_started
+                + _UPSTREAM_RETRY_DELAYS[attempt - 1]
+                > _UPSTREAM_RETRY_DEADLINE
+            )
+            if exhausted:
+                waited = time.perf_counter() - retry_started
+                logger.warning(
+                    "%s %s -> 502 (upstream not ready after %d attempts, %.1fs) (%s)",
+                    request.method,
+                    request.raw_path,
+                    attempt,
+                    waited,
+                    message,
+                )
+                return web.json_response(
+                    {
+                        "error": (
+                            "upstream is still preparing this file; the proxy waited "
+                            f"{_UPSTREAM_RETRY_DEADLINE:.0f}s. Please try again shortly"
+                        ),
+                        "detail": message,
+                    },
+                    status=502,
+                )
+            delay = _UPSTREAM_RETRY_DELAYS[attempt - 1]
+            logger.warning(
+                "%s %s -> upstream broke before body (%s); retry %d/%d in %.0fs "
+                "(waiting for upstream cold-start)",
+                request.method,
+                request.raw_path,
+                message,
+                attempt,
+                len(_UPSTREAM_RETRY_DELAYS),
+                delay,
+            )
+            await asyncio.sleep(delay)
 
     out_headers = CIMultiDict()
     for name, value in upstream.headers.items():
@@ -219,7 +291,7 @@ async def _forward(request):
         and upstream.status == 207
         and config.href_strip_prefix
     ):
-        raw_body = await upstream.content.read()
+        raw_body = first_chunk + await upstream.content.read()
         upstream.release()
         body = _rewrite_multistatus(raw_body, config.href_strip_prefix)
         logger.info(
@@ -237,9 +309,14 @@ async def _forward(request):
         out_headers["Content-Length"] = upstream.headers["Content-Length"]
 
     response = web.StreamResponse(status=upstream.status, headers=out_headers)
+    written = 0
     try:
         await response.prepare(request)
+        written = len(first_chunk)
+        if first_chunk:
+            await response.write(first_chunk)
         async for chunk in upstream.content.iter_any():
+            written += len(chunk)
             await response.write(chunk)
         await response.write_eof()
     except asyncio.CancelledError:
@@ -249,15 +326,19 @@ async def _forward(request):
         response.force_close()
         if _is_client_abort(exc):
             logger.info(
-                "%s %s -> client aborted transfer",
+                "%s %s -> client aborted transfer (%s bytes sent)",
                 request.method,
                 request.raw_path,
+                written,
             )
         else:
             logger.warning(
-                "%s %s -> stream aborted (%s)",
+                "%s %s -> upstream stream truncated after %s/%s bytes (%s); "
+                "client should resume via Range",
                 request.method,
                 request.raw_path,
+                written,
+                out_headers.get("Content-Length", "?"),
                 str(exc) or type(exc).__name__,
             )
     finally:
