@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 
 from webdav_proxy.__main__ import main
 from webdav_proxy.config import ConfigError, load_config, load_dotenv_file
@@ -9,6 +9,12 @@ BASE_ENV = {
     "PROXY_USER": "alice",
     "PROXY_PASSWORD": "wonderland",
 }
+
+_NO_ENV_FILE = "no-such-.env-in-tests"
+
+
+def load(env=None, env_file=_NO_ENV_FILE):
+    return load_config(env=env, env_file=env_file)
 
 DOTENV_TEXT = "\n".join(
     [
@@ -44,7 +50,7 @@ def write_env_file(tmp_path, text):
 class TestRequiredVariables:
     def test_missing_all_lists_every_variable(self):
         with pytest.raises(ConfigError) as excinfo:
-            load_config(env={})
+            load(env={})
         message = str(excinfo.value)
         assert "UPSTREAM_URL" in message
         assert "PROXY_USER" in message
@@ -52,27 +58,27 @@ class TestRequiredVariables:
 
     def test_missing_upstream_url(self):
         with pytest.raises(ConfigError) as excinfo:
-            load_config(env=make_env(UPSTREAM_URL=None))
+            load(env=make_env(UPSTREAM_URL=None))
         assert "UPSTREAM_URL" in str(excinfo.value)
 
     def test_missing_proxy_user(self):
         with pytest.raises(ConfigError) as excinfo:
-            load_config(env=make_env(PROXY_USER=None))
+            load(env=make_env(PROXY_USER=None))
         assert "PROXY_USER" in str(excinfo.value)
 
     def test_missing_proxy_password(self):
         with pytest.raises(ConfigError) as excinfo:
-            load_config(env=make_env(PROXY_PASSWORD=None))
+            load(env=make_env(PROXY_PASSWORD=None))
         assert "PROXY_PASSWORD" in str(excinfo.value)
 
     def test_empty_value_counts_as_missing(self):
         with pytest.raises(ConfigError):
-            load_config(env=make_env(PROXY_PASSWORD=""))
+            load(env=make_env(PROXY_PASSWORD=""))
 
 
 class TestDefaultsAndOverrides:
     def test_defaults(self):
-        config = load_config(env=make_env())
+        config = load(env=make_env())
         assert config.upstream_url == "https://dav.example.com/dav/"
         assert config.upstream_user == ""
         assert config.upstream_password == ""
@@ -84,21 +90,21 @@ class TestDefaultsAndOverrides:
 
     @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES", "Yes"])
     def test_read_only_truthy(self, raw):
-        assert load_config(env=make_env(READ_ONLY=raw)).read_only is True
+        assert load(env=make_env(READ_ONLY=raw)).read_only is True
 
     @pytest.mark.parametrize("raw", ["false", "0", "no", "off", "", "random"])
     def test_read_only_falsy(self, raw):
-        assert load_config(env=make_env(READ_ONLY=raw)).read_only is False
+        assert load(env=make_env(READ_ONLY=raw)).read_only is False
 
     def test_invalid_port_raises(self):
         with pytest.raises(ConfigError):
-            load_config(env=make_env(PORT="not-a-number"))
+            load(env=make_env(PORT="not-a-number"))
 
 
 class TestDotenv:
     def test_parses_export_quotes_and_comments(self, tmp_path):
         env_file = write_env_file(tmp_path, DOTENV_TEXT)
-        config = load_config(env={}, env_file=env_file)
+        config = load(env={}, env_file=env_file)
         assert config.upstream_url == "https://dav.example.com/dav/"
         assert config.proxy_user == "bob"
         assert config.proxy_password == "p@ss word"
@@ -117,7 +123,7 @@ class TestDotenv:
         assert load_dotenv_file(env_file) == {"OK": "1"}
 
     def test_env_file_missing_is_ok(self, tmp_path):
-        config = load_config(env=make_env(), env_file=str(tmp_path / "absent.env"))
+        config = load(env=make_env(), env_file=str(tmp_path / "absent.env"))
         assert config.port == 8080
 
     def test_real_environment_wins_over_dotenv(self, tmp_path):
