@@ -34,6 +34,28 @@ _HREF_RE = re.compile(
 
 _URL_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://[^/]*)(/.*)$", re.DOTALL)
 
+_CLIENT_ABORT_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+_CLIENT_ABORT_MESSAGE = "Cannot write to closing transport"
+
+
+def _is_client_abort(exc):
+    return isinstance(exc, _CLIENT_ABORT_ERRORS) or (
+        isinstance(exc, RuntimeError) and _CLIENT_ABORT_MESSAGE in str(exc)
+    )
+
+
+def loop_exception_handler(loop, context):
+    exc = context.get("exception")
+    message = str(context.get("message", ""))
+    if (
+        _is_client_abort(exc)
+        and ("connection_lost" in message or "shutdown" in message)
+    ):
+        logger.debug("client connection dropped: %s", exc)
+        return
+    loop.default_exception_handler(context)
+
 _STRIP_REQUEST_HEADERS = frozenset(
     {
         "connection",
@@ -215,14 +237,24 @@ async def _forward(request):
         async for chunk in upstream.content.iter_any():
             await response.write(chunk)
         await response.write_eof()
+    except asyncio.CancelledError:
+        response.force_close()
+        raise
     except Exception as exc:
         response.force_close()
-        logger.warning(
-            "%s %s -> stream aborted (%s)",
-            request.method,
-            request.raw_path,
-            str(exc) or type(exc).__name__,
-        )
+        if _is_client_abort(exc):
+            logger.info(
+                "%s %s -> client aborted transfer",
+                request.method,
+                request.raw_path,
+            )
+        else:
+            logger.warning(
+                "%s %s -> stream aborted (%s)",
+                request.method,
+                request.raw_path,
+                str(exc) or type(exc).__name__,
+            )
     finally:
         upstream.close()
 

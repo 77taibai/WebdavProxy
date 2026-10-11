@@ -9,9 +9,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from webdav_proxy.config import Config
 from webdav_proxy.proxy import (
     WRITE_METHODS,
+    _is_client_abort,
     _rewrite_multistatus,
     _strip_href_prefix,
     create_app,
+    loop_exception_handler,
 )
 
 PROXY_USER = "client"
@@ -438,6 +440,40 @@ def test_rewrite_multistatus_keeps_other_tags():
     out = _rewrite_multistatus(xml, "/test").decode("utf-8")
     assert "<D:href>/a.txt</D:href>" in out
     assert "<D:displayname>a.txt</D:displayname>" in out
+
+
+def test_client_abort_detection():
+    assert _is_client_abort(ConnectionResetError(10054, "remote host reset"))
+    assert _is_client_abort(ConnectionAbortedError(10053, "abort"))
+    assert _is_client_abort(BrokenPipeError(32, "broken pipe"))
+    assert _is_client_abort(RuntimeError("Cannot write to closing transport"))
+    assert not _is_client_abort(RuntimeError("some other runtime failure"))
+    assert not _is_client_abort(ValueError("bad url"))
+
+
+class _FakeLoop:
+    def __init__(self):
+        self.default_calls = []
+
+    def default_exception_handler(self, context):
+        self.default_calls.append(context)
+
+
+def test_loop_handler_silences_client_disconnect_noise():
+    loop = _FakeLoop()
+    context = {
+        "message": "Exception in callback _ProactorBasePipeTransport._call_connection_lost()",
+        "exception": ConnectionResetError(10054, "remote host reset"),
+    }
+    loop_exception_handler(loop, context)
+    assert loop.default_calls == []
+
+
+def test_loop_handler_escalates_unknown_errors():
+    loop = _FakeLoop()
+    context = {"message": "boom", "exception": RuntimeError("unexpected")}
+    loop_exception_handler(loop, context)
+    assert loop.default_calls == [context]
 
 
 @aio_test
