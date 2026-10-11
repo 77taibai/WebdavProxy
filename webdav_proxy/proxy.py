@@ -231,6 +231,11 @@ async def _forward(request):
         )
         return web.Response(status=207, body=body, headers=out_headers)
 
+    if not upstream.headers.get("Content-Encoding") and upstream.headers.get(
+        "Content-Length"
+    ):
+        out_headers["Content-Length"] = upstream.headers["Content-Length"]
+
     response = web.StreamResponse(status=upstream.status, headers=out_headers)
     try:
         await response.prepare(request)

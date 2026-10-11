@@ -103,6 +103,14 @@ def make_upstream(state):
             headers={"Content-Type": "text/plain", "X-Webdav-Echo": "yes"},
         )
 
+    async def gz_file(request):
+        import gzip as _gzip
+
+        return web.Response(
+            body=_gzip.compress(b"hello world"),
+            headers={"Content-Encoding": "gzip", "Content-Type": "text/plain"},
+        )
+
     async def write_handler(request):
         state["writes"].append(request.method)
         state["last_body"] = await request.read()
@@ -126,7 +134,10 @@ def make_upstream(state):
     app = web.Application(middlewares=[guard])
     app.router.add_route("PROPFIND", "/", propfind)
     app.router.add_route("GET", "/big", big)
+    app.router.add_route("HEAD", "/big", big)
     app.router.add_route("GET", "/files/big.txt", big_file)
+    app.router.add_route("HEAD", "/files/big.txt", big_file)
+    app.router.add_route("GET", "/gz/video.bin", gz_file)
     app.router.add_route("*", "/write", write_handler)
     app.router.add_route("*", "/forward", any_method)
     app.router.add_route("*", "/test{tail:.*}", prefixed)
@@ -474,6 +485,43 @@ def test_loop_handler_escalates_unknown_errors():
     context = {"message": "boom", "exception": RuntimeError("unexpected")}
     loop_exception_handler(loop, context)
     assert loop.default_calls == [context]
+
+
+@aio_test
+async def test_get_preserves_content_length_after_redirect():
+    client, upstream, state = await start_stack()
+    try:
+        resp = await client.get("/big", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert resp.headers["Content-Length"] == str(len(FULL_CONTENT))
+    finally:
+        await stop_stack(client, upstream)
+
+
+@aio_test
+async def test_head_preserves_content_length():
+    client, upstream, state = await start_stack()
+    try:
+        resp = await client.head("/big", headers={"Authorization": CLIENT_AUTH})
+        assert resp.status == 200
+        assert resp.headers["Content-Length"] == str(len(FULL_CONTENT))
+    finally:
+        await stop_stack(client, upstream)
+
+
+@aio_test
+async def test_compressed_response_omits_stale_content_length():
+    client, upstream, state = await start_stack()
+    try:
+        resp = await client.get(
+            "/gz/video.bin",
+            headers={"Authorization": CLIENT_AUTH, "Accept-Encoding": "gzip"},
+        )
+        assert resp.status == 200
+        assert await resp.read() == b"hello world"
+        assert "Content-Length" not in resp.headers
+    finally:
+        await stop_stack(client, upstream)
 
 
 @aio_test
