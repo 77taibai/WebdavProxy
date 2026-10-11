@@ -3,7 +3,7 @@ feature: webdav-proxy
 status: delivered
 updated: 2026-10-11
 branch: feature/webdav-proxy
-commits: f7c0358..585ffb5
+commits: e2db059..fd74066
 ---
 
 # WebDAV 代理程序
