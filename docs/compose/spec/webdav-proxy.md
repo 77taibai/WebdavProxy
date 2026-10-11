@@ -3,7 +3,7 @@ feature: webdav-proxy
 status: delivered
 updated: 2026-10-11
 branch: feature/webdav-proxy
-commits: e2db059..fd74066
+commits: e2db059..e2b31fd
 ---
 
 # WebDAV 代理程序
@@ -12,12 +12,12 @@ commits: e2db059..fd74066
 
 **What was built** — 一个基于 Python/aiohttp 的 WebDAV 中间代理。客户端以 Basic 认证访问代理（`PROXY_USER`/`PROXY_PASSWORD`），代理用环境变量配置的上游凭据（`UPSTREAM_URL`/`UPSTREAM_USER`/`UPSTREAM_PASSWORD`）转发全部 WebDAV 方法，双向流式、不落盘。上游 302/301/307/308 由代理自行跟随（跨域跳转时 auth 由 aiohttp 自动剥离，实测证实），客户端永远只看到最终响应，`Range` 断点续传经跳转后可用。`READ_ONLY=true` 时九种写方法被 403 拦截且不触达上游。配置支持 `.env`（自实现解析，真实环境变量优先）；启动时缺必填变量报错退出。附带 `python:3.12-slim` 非 root Dockerfile（SaaS `PORT` 注入兼容）、`/healthz` 免认证健康检查、中文 README 与 `.env.example`。
 
-**Verification** — `.\.venv\Scripts\python.exe -m pytest tests -q` → 38 passed（含配置/认证/302 跟随/跨域不泄凭据/Range 透传/流式上传/全 14 方法转发/只读 403/502/查询串转发）；实测探针证实跨域 302 剥离 `Authorization`、流式 body 的 PUT 遇重定向按已知限制返回 502。独立评审子代理结论：Spec compliance PASS、Correctness PASS、Consistency PASS → APPROVED；其提出的 4 个 minor（prepare 泄漏、流式中断静默、`OPTIONS *` ValueError→500、共享 CookieJar）与 2 项测试补强已全部修复并重测通过。
+**Verification** — `.\.venv\Scripts\python.exe -m pytest tests -q` → 38 passed（含配置/认证/302 跟随/跨域不泄凭据/Range 透传/流式上传/全 14 方法转发/只读 403/502/查询串转发）。测试与真实 `.env` 完全隔离（显式钉死 `env_file`），在用户于工作目录放置真实 `.env` 的场景下依然全绿。实测探针证实跨域 302 剥离 `Authorization`、流式 body 的 PUT 遇重定向按已知限制返回 502。独立评审子代理结论：Spec compliance PASS、Correctness PASS、Consistency PASS → APPROVED；其提出的 4 个 minor（prepare 泄漏、流式中断静默、`OPTIONS *` ValueError→500、共享 CookieJar）与 2 项测试补强已全部修复并重测通过。
 
 **Journey log**
 - `OPTIONS *`（星形 request-target）会让 `raw_path` 拼进上游 URL 触发 yarl 的 `ValueError`；在 502 捕获集中加 `ValueError` 兜底。
 - 带流式 body 的写方法被上游重定向时，aiohttp 无法重放请求体 → 502；不要为可重放而全文缓冲上传体（大文件内存爆）。
-- yarl 的 `query_string` 在服务端会解码再编码，断言查询串时用 ASCII 参数避免编码假设。
+- `load_config` 默认读 cwd 的 `.env`，真实配置文件会渗入未钉死 `env_file` 的测试；测试必须显式隔离，用户自建的 `.env` 出现瞬间即暴露此类脆弱用例。
 - 编辑测试文件时切走了 502 测试的函数定义行，靠 pytest 立即失败暴露——重审编辑后必须跑套件。
 - aiohttp `DummyCookieJar` 可避免代理会话间共享上游 cookie 造成跨客户端状态渗透。
 
