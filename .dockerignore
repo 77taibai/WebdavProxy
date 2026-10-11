@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 版本控制与工作树
+.git/
+.worktrees/
+
+# 密钥与本地配置（严禁打进镜像）
+.env
+.env.*
+
+# 测试与文档
+tests/
+docs/
+
+# 本仓库自身的构建文件
+Dockerfile
+.dockerignore
+README.md
+
+# 日志与临时文件
+*.log
+.agent-server.json
